@@ -13,8 +13,35 @@ import 'package:video_thumbnail/video_thumbnail.dart';
 const photoExt = {'.jpg', '.jpeg', '.png', '.webp'};
 const videoExt = {'.mp4', '.mov', '.m4v'};
 
+/// Penyedia AI yang didukung.
+class ProviderInfo {
+  const ProviderInfo(this.id, this.label, this.base, this.defaultModel, this.keyHelp);
+  final String id;
+  final String label;
+  final String base; // alamat dasar API gaya OpenAI (kosong untuk Gemini/Kustom)
+  final String defaultModel;
+  final String keyHelp;
+}
+
+const providers = <ProviderInfo>[
+  ProviderInfo('gemini', 'Gemini', '', 'gemini-3.6-flash', 'aistudio.google.com/apikey'),
+  ProviderInfo('openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1',
+      'google/gemma-3-27b-it:free', 'openrouter.ai/keys'),
+  ProviderInfo('groq', 'Groq', 'https://api.groq.com/openai/v1',
+      'meta-llama/llama-4-scout-17b-16e-instruct', 'console.groq.com/keys'),
+  ProviderInfo('mistral', 'Mistral', 'https://api.mistral.ai/v1', 'mistral-small-latest',
+      'console.mistral.ai/api-keys'),
+  ProviderInfo('custom', 'Kustom (gaya OpenAI)', '', '',
+      'isi alamat API dan nama model sendiri (mis. Together, NVIDIA NIM)'),
+];
+
+ProviderInfo providerOf(String id) =>
+    providers.firstWhere((x) => x.id == id, orElse: () => providers.first);
+
 /// Pengaturan aplikasi (disimpan di HP).
 class Settings {
+  String provider = 'gemini';
+  String customBase = '';
   String keys = '';
   String model = 'gemini-3.6-flash';
   int keywordCount = 49;
@@ -35,10 +62,21 @@ class Settings {
       .toSet()
       .toList();
 
+  /// Muat key + model milik penyedia yang sedang aktif.
+  Future<void> loadProviderFields() async {
+    final sp = await SharedPreferences.getInstance();
+    final legacyKeys = provider == 'gemini' ? sp.getString('keys') : null;
+    final legacyModel = provider == 'gemini' ? sp.getString('model') : null;
+    keys = sp.getString('keys_$provider') ?? legacyKeys ?? '';
+    model = sp.getString('model_$provider') ??
+        legacyModel ??
+        providerOf(provider).defaultModel;
+    customBase = sp.getString('customBase') ?? customBase;
+  }
+
   Future<void> load() async {
     final sp = await SharedPreferences.getInstance();
-    keys = sp.getString('keys') ?? keys;
-    model = sp.getString('model') ?? model;
+    provider = sp.getString('provider') ?? provider;
     keywordCount = sp.getInt('keywordCount') ?? keywordCount;
     delaySec = sp.getInt('delaySec') ?? delaySec;
     style = sp.getString('style') ?? style;
@@ -49,12 +87,15 @@ class Settings {
     retry = sp.getBool('retry') ?? retry;
     inputDir = sp.getString('inputDir') ?? inputDir;
     outputDir = sp.getString('outputDir') ?? outputDir;
+    await loadProviderFields();
   }
 
   Future<void> save() async {
     final sp = await SharedPreferences.getInstance();
-    await sp.setString('keys', keys);
-    await sp.setString('model', model);
+    await sp.setString('provider', provider);
+    await sp.setString('keys_$provider', keys);
+    await sp.setString('model_$provider', model);
+    await sp.setString('customBase', customBase);
     await sp.setInt('keywordCount', keywordCount);
     await sp.setInt('delaySec', delaySec);
     await sp.setString('style', style);
@@ -138,25 +179,67 @@ Uint8List _prepPhoto(Uint8List bytes) {
 }
 
 class Processor {
-  Processor(this.s, this.log, this.onProgress);
+  /// [files] diisi bila pengguna memilih file tertentu. Kalau null, semua file
+  /// di folder input diproses.
+  /// [fromPicker] true bila file berasal dari pemilih file sistem (salinan
+  /// sementara di cache). File asli tidak dihapus dan salinan cache dibersihkan.
+  Processor(this.s, this.log, this.onProgress, {this.files, this.fromPicker = false});
 
   final Settings s;
   final void Function(String) log;
   final void Function(int ok, int fail, int total) onProgress;
+  final List<File>? files;
+  final bool fromPicker;
   bool _stop = false;
 
   void stop() => _stop = true;
 
+  static bool isMedia(String path) {
+    final e = p.extension(path).toLowerCase();
+    return photoExt.contains(e) || videoExt.contains(e);
+  }
+
+  static List<File> scanFolder(String dir) {
+    try {
+      return Directory(dir)
+          .listSync()
+          .whereType<File>()
+          .where((f) => isMedia(f.path))
+          .toList()
+        ..sort((a, b) => a.path.compareTo(b.path));
+    } catch (_) {
+      return <File>[];
+    }
+  }
+
   // ---------------------------------------------------------------- utama
 
   Future<void> run() async {
+    try {
+      await _run();
+    } finally {
+      if (fromPicker) {
+        for (final f in files ?? const <File>[]) {
+          try {
+            if (f.existsSync()) f.deleteSync();
+          } catch (_) {}
+        }
+      }
+    }
+  }
+
+  Future<void> _run() async {
     final keys = s.keyList;
     if (keys.isEmpty) {
       log('✖ Isi minimal satu API key.');
       return;
     }
-    if (s.inputDir.isEmpty || !await Directory(s.inputDir).exists()) {
-      log('✖ Folder input belum dipilih atau tidak ditemukan.');
+    if (s.model.trim().isEmpty) {
+      log('✖ Isi nama model.');
+      return;
+    }
+    if (s.provider == 'custom' && s.customBase.trim().isEmpty) {
+      log('✖ Isi alamat API untuk penyedia Kustom.');
       return;
     }
     if (s.outputDir.isEmpty) {
@@ -171,38 +254,35 @@ class Processor {
       return;
     }
 
-    List<File> files;
-    try {
-      files = Directory(s.inputDir)
-          .listSync()
-          .whereType<File>()
-          .where((f) {
-            final e = p.extension(f.path).toLowerCase();
-            return photoExt.contains(e) || videoExt.contains(e);
-          })
-          .toList()
-        ..sort((a, b) => a.path.compareTo(b.path));
-    } catch (e) {
-      log('✖ Tidak bisa membaca folder input: $e');
-      return;
+    List<File> list;
+    if (files != null) {
+      list = [for (final f in files!) if (await f.exists()) f];
+    } else {
+      if (s.inputDir.isEmpty || !await Directory(s.inputDir).exists()) {
+        log('✖ Folder input belum dipilih atau tidak ditemukan.');
+        return;
+      }
+      list = scanFolder(s.inputDir);
     }
-    if (files.isEmpty) {
-      log('Tidak ada foto/video di folder input.');
+    if (list.isEmpty) {
+      log('Tidak ada foto/video yang bisa diproses.');
       return;
     }
 
-    log('Mulai: ${files.length} file, ${keys.length} API key, model ${s.model}');
+    log('Mulai: ${list.length} file, ${keys.length} API key, '
+        '${providerOf(s.provider).label} / ${s.model}');
+    if (fromPicker) log('Mode pilih file: file asli tidak diubah, hasil disalin ke output.');
     final pool = _KeyPool(keys);
     var ok = 0, fail = 0, streak = 0;
-    onProgress(0, 0, files.length);
+    onProgress(0, 0, list.length);
 
-    for (var i = 0; i < files.length; i++) {
+    for (var i = 0; i < list.length; i++) {
       if (_stop) {
         log('■ Dihentikan.');
         break;
       }
-      final f = files[i];
-      log('── [${i + 1}/${files.length}] ${p.basename(f.path)}');
+      final f = list[i];
+      log('── [${i + 1}/${list.length}] ${p.basename(f.path)}');
       final meta = await _analyze(f, pool);
       if (meta == null) {
         fail++;
@@ -218,12 +298,12 @@ class Processor {
           log('  ✖ Gagal memindah/menyalin file: $e');
         }
       }
-      onProgress(ok, fail, files.length);
+      onProgress(ok, fail, list.length);
       if (streak >= 5 && !_stop) {
         log('■ Berhenti otomatis: 5 file gagal berturut-turut. Cek key, model, atau koneksi.');
         break;
       }
-      if (i < files.length - 1 && !_stop) await _wait(s.delaySec);
+      if (i < list.length - 1 && !_stop) await _wait(s.delaySec);
     }
     log('SELESAI! Berhasil: $ok | Gagal: $fail');
   }
@@ -263,7 +343,9 @@ class Processor {
         return null;
       }
       try {
-        final m = await _callGemini(key.value, images, isVideo);
+        final res = await _send(key.value, prompt: _prompt(isVideo), images: images);
+        _throwForStatus(res);
+        final m = _parse(_extractText(res));
         log('  Title   : ${m.title}');
         log('  Keywords: ${m.keywords.length} → ${m.keywords.take(6).join(", ")}...');
         log('  Kategori: ${m.category}');
@@ -312,7 +394,149 @@ class Processor {
     return Isolate.run(() => _prepPhoto(bytes));
   }
 
-  // -------------------------------------------------------------- Gemini
+  // ------------------------------------------------------------- jaringan
+
+  String _chatUrl() {
+    var base = s.provider == 'custom' ? s.customBase.trim() : providerOf(s.provider).base;
+    while (base.endsWith('/')) {
+      base = base.substring(0, base.length - 1);
+    }
+    return base.endsWith('/chat/completions') ? base : '$base/chat/completions';
+  }
+
+  /// Kirim permintaan ke penyedia aktif. [maxTokens] > 0 membatasi panjang jawaban.
+  Future<http.Response> _send(
+    String key, {
+    required String prompt,
+    List<Uint8List> images = const [],
+    int maxTokens = 0,
+  }) {
+    if (s.provider == 'gemini') {
+      final uri = Uri.parse(
+        'https://generativelanguage.googleapis.com/v1beta/models/${s.model}:generateContent?key=$key',
+      );
+      final parts = <Map<String, dynamic>>[
+        {'text': prompt},
+        for (final b in images)
+          {
+            'inline_data': {'mime_type': 'image/jpeg', 'data': base64Encode(b)},
+          },
+      ];
+      final gen = <String, dynamic>{'temperature': 0.4};
+      if (images.isNotEmpty) gen['responseMimeType'] = 'application/json';
+      if (maxTokens > 0) gen['maxOutputTokens'] = maxTokens;
+      return http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'contents': [
+                {'parts': parts},
+              ],
+              'generationConfig': gen,
+            }),
+          )
+          .timeout(const Duration(seconds: 90));
+    }
+
+    final content = <Map<String, dynamic>>[
+      {'type': 'text', 'text': prompt},
+      for (final b in images)
+        {
+          'type': 'image_url',
+          'image_url': s.provider == 'mistral'
+              ? 'data:image/jpeg;base64,${base64Encode(b)}'
+              : {'url': 'data:image/jpeg;base64,${base64Encode(b)}'},
+        },
+    ];
+    final body = <String, dynamic>{
+      'model': s.model,
+      'messages': [
+        {'role': 'user', 'content': images.isEmpty ? prompt : content},
+      ],
+      'temperature': 0.4,
+    };
+    if (maxTokens > 0) body['max_tokens'] = maxTokens;
+    return http
+        .post(
+          Uri.parse(_chatUrl()),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $key',
+            'X-Title': 'Stok Meta',
+          },
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 90));
+  }
+
+  void _throwForStatus(http.Response res) {
+    final code = res.statusCode;
+    if (code == 200) return;
+    final msg = _errMsg(res);
+    if (code == 429) throw KeyLimitException();
+    if (code == 401 ||
+        code == 402 ||
+        code == 403 ||
+        (code == 400 && res.body.contains('API key'))) {
+      throw KeyDeadException(msg);
+    }
+    if (code == 404) {
+      throw FatalException(
+        'Model "${s.model}" atau alamat API tidak ditemukan. ($msg)',
+      );
+    }
+    if (code == 400 &&
+        RegExp(r'(vision|multimodal|image input|does not support image|image_url)',
+                caseSensitive: false)
+            .hasMatch(msg)) {
+      throw FatalException(
+        'Model "${s.model}" sepertinya tidak mendukung gambar. Pakai model vision. ($msg)',
+      );
+    }
+    throw Exception('HTTP $code: $msg');
+  }
+
+  String _errMsg(http.Response res) {
+    try {
+      final j = jsonDecode(utf8.decode(res.bodyBytes));
+      final e = j['error'];
+      if (e is Map && e['message'] != null) return e['message'].toString();
+      if (e is String) return e;
+      if (j['message'] != null) return j['message'].toString();
+    } catch (_) {}
+    final b = res.body;
+    return b.length > 120 ? b.substring(0, 120) : b;
+  }
+
+  String _extractText(http.Response res) {
+    final j = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+    if (s.provider == 'gemini') {
+      final cands = j['candidates'];
+      if (cands is! List || cands.isEmpty) {
+        throw Exception('AI tidak memberi jawaban (mungkin diblokir filter).');
+      }
+      final partList = (cands[0]['content']?['parts'] ?? []) as List;
+      return partList
+          .where((e) => e is Map && e['text'] != null && e['thought'] != true)
+          .map((e) => e['text'].toString())
+          .join();
+    }
+    final choices = j['choices'];
+    if (choices is! List || choices.isEmpty) {
+      final e = j['error'];
+      final m = e is Map ? e['message'] : null;
+      throw Exception('AI tidak memberi jawaban${m != null ? ": $m" : ""}');
+    }
+    final c = choices[0]['message']?['content'];
+    if (c is String) return c;
+    if (c is List) {
+      return c.map((e) => e is Map ? (e['text'] ?? '').toString() : '').join();
+    }
+    throw Exception('Format jawaban AI tidak dikenali.');
+  }
+
+  // -------------------------------------------------------------- prompt
 
   String _prompt(bool video) {
     final styleRule = switch (s.style) {
@@ -333,65 +557,6 @@ Rules:
 - Never mention brand names, trademarks, real people's names, or the software, AI tool or camera used.
 - Keywords: up to ${s.keywordCount} keywords in $lang, most relevant first, no duplicates, single words or short phrases.
 - Category: pick ONE number: 1 Animals, 2 Buildings and Architecture, 3 Business, 4 Drinks, 5 The Environment, 6 States of Mind, 7 Food, 8 Graphic Resources, 9 Hobbies and Leisure, 10 Industry, 11 Landscapes, 12 Lifestyle, 13 People, 14 Plants and Flowers, 15 Culture and Religion, 16 Science, 17 Social Issues, 18 Sports, 19 Technology, 20 Transport, 21 Travel.''';
-  }
-
-  Future<Meta> _callGemini(String key, List<Uint8List> images, bool video) async {
-    final uri = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/${s.model}:generateContent?key=$key',
-    );
-    final parts = <Map<String, dynamic>>[
-      {'text': _prompt(video)},
-      for (final b in images)
-        {
-          'inline_data': {'mime_type': 'image/jpeg', 'data': base64Encode(b)},
-        },
-    ];
-    final body = jsonEncode({
-      'contents': [
-        {'parts': parts},
-      ],
-      'generationConfig': {
-        'temperature': 0.4,
-        'responseMimeType': 'application/json',
-      },
-    });
-    final res = await http
-        .post(uri, headers: {'Content-Type': 'application/json'}, body: body)
-        .timeout(const Duration(seconds: 90));
-
-    if (res.statusCode == 429) throw KeyLimitException();
-    if (res.statusCode == 403 ||
-        (res.statusCode == 400 && res.body.contains('API key'))) {
-      throw KeyDeadException(_errMsg(res));
-    }
-    if (res.statusCode == 404) {
-      throw FatalException('Model "${s.model}" tidak ditemukan. Periksa nama model.');
-    }
-    if (res.statusCode != 200) {
-      throw Exception('HTTP ${res.statusCode}: ${_errMsg(res)}');
-    }
-
-    final j = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
-    final cands = j['candidates'];
-    if (cands is! List || cands.isEmpty) {
-      throw Exception('AI tidak memberi jawaban (mungkin diblokir filter).');
-    }
-    final partList = (cands[0]['content']?['parts'] ?? []) as List;
-    final text = partList
-        .where((e) => e is Map && e['text'] != null && e['thought'] != true)
-        .map((e) => e['text'].toString())
-        .join();
-    return _parse(text);
-  }
-
-  String _errMsg(http.Response res) {
-    try {
-      final j = jsonDecode(utf8.decode(res.bodyBytes));
-      final m = j['error']?['message'];
-      if (m != null) return m.toString();
-    } catch (_) {}
-    final b = res.body;
-    return b.length > 120 ? b.substring(0, 120) : b;
   }
 
   Meta _parse(String text) {
@@ -463,8 +628,9 @@ Rules:
       n++;
     }
     final dest = p.join(out.path, name);
+    final moved = s.move && !fromPicker;
     if (!p.equals(dest, src.path)) {
-      if (s.move) {
+      if (moved) {
         try {
           await src.rename(dest);
         } on FileSystemException {
@@ -475,7 +641,7 @@ Rules:
         await src.copy(dest);
       }
     }
-    log('  ✔ ${s.move ? "Dipindah" : "Disalin"} → $name');
+    log('  ✔ ${moved ? "Dipindah" : "Disalin"} → $name');
     if (s.csv) await _appendCsv(out, name, m);
   }
 
@@ -491,45 +657,30 @@ Rules:
 
   // ----------------------------------------------------------- cek key
 
-  static Future<void> checkKeys(
-    List<String> keys,
-    String model,
-    void Function(String) log,
-  ) async {
+  Future<void> checkKeys() async {
+    final keys = s.keyList;
     if (keys.isEmpty) {
       log('✖ Belum ada API key.');
       return;
     }
-    log('Mengecek ${keys.length} key...');
+    if (s.provider == 'custom' && s.customBase.trim().isEmpty) {
+      log('✖ Isi alamat API untuk penyedia Kustom.');
+      return;
+    }
+    log('Mengecek ${keys.length} key (${providerOf(s.provider).label} / ${s.model})...');
     for (final k in keys) {
       final tail = k.length > 4 ? k.substring(k.length - 4) : k;
       try {
-        final res = await http
-            .post(
-              Uri.parse(
-                'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$k',
-              ),
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({
-                'contents': [
-                  {
-                    'parts': [
-                      {'text': 'Reply with OK'},
-                    ],
-                  },
-                ],
-                'generationConfig': {'maxOutputTokens': 8},
-              }),
-            )
-            .timeout(const Duration(seconds: 30));
-        if (res.statusCode == 200) {
+        final res = await _send(k, prompt: 'Reply with OK', maxTokens: 8);
+        final code = res.statusCode;
+        if (code == 200) {
           log('  ✔ ...$tail aktif');
-        } else if (res.statusCode == 429) {
+        } else if (code == 429) {
           log('  ⚠ ...$tail valid tapi kena limit sementara');
-        } else if (res.statusCode == 404) {
-          log('  ✖ Model "$model" tidak ditemukan (key ...$tail).');
+        } else if (code == 404) {
+          log('  ✖ Model atau alamat API tidak ditemukan (key ...$tail).');
         } else {
-          log('  ✖ ...$tail tidak valid (HTTP ${res.statusCode})');
+          log('  ✖ ...$tail bermasalah (HTTP $code: ${_errMsg(res)})');
         }
       } catch (e) {
         log('  ✖ ...$tail gagal dicek: $e');
