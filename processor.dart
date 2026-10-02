@@ -52,6 +52,7 @@ class Settings {
   bool move = true;
   bool csv = true;
   bool retry = true;
+  bool embed = true;
   String inputDir = '';
   String outputDir = '';
 
@@ -85,6 +86,7 @@ class Settings {
     move = sp.getBool('move') ?? move;
     csv = sp.getBool('csv') ?? csv;
     retry = sp.getBool('retry') ?? retry;
+    embed = sp.getBool('embed') ?? embed;
     inputDir = sp.getString('inputDir') ?? inputDir;
     outputDir = sp.getString('outputDir') ?? outputDir;
     await loadProviderFields();
@@ -104,6 +106,7 @@ class Settings {
     await sp.setBool('move', move);
     await sp.setBool('csv', csv);
     await sp.setBool('retry', retry);
+    await sp.setBool('embed', embed);
     await sp.setString('inputDir', inputDir);
     await sp.setString('outputDir', outputDir);
   }
@@ -176,6 +179,127 @@ Uint8List _prepPhoto(Uint8List bytes) {
         : img.copyResize(im, height: 1024);
   }
   return Uint8List.fromList(img.encodeJpg(r, quality: 80));
+}
+
+// ------------------------------------------------------------------
+// Tanam metadata ke JPEG (IPTC-IIM + XMP) tanpa mengompres ulang gambar.
+// ------------------------------------------------------------------
+
+String _xmlEsc(String s) => s
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+
+List<int> _iptcRec(int rec, int ds, List<int> data) =>
+    [0x1c, rec, ds, (data.length >> 8) & 0xff, data.length & 0xff, ...data];
+
+List<int> _segment(int marker, List<int> payload) {
+  final len = payload.length + 2;
+  if (len > 0xffff) throw Exception('Metadata terlalu besar');
+  return [0xff, marker, (len >> 8) & 0xff, len & 0xff, ...payload];
+}
+
+bool _hasPrefix(Uint8List d, int start, List<int> prefix) {
+  if (start + prefix.length > d.length) return false;
+  for (var i = 0; i < prefix.length; i++) {
+    if (d[start + i] != prefix[i]) return false;
+  }
+  return true;
+}
+
+List<int> _buildApp13(String title, List<String> kws) {
+  final t = utf8.encode(title);
+  final b = BytesBuilder();
+  b.add(_iptcRec(1, 0x5a, [0x1b, 0x25, 0x47])); // UTF-8
+  b.add(_iptcRec(2, 0, [0x00, 0x04]));
+  b.add(_iptcRec(2, 5, t)); // Object Name (judul)
+  b.add(_iptcRec(2, 105, t)); // Headline
+  b.add(_iptcRec(2, 120, t)); // Caption/Abstract
+  for (final k in kws) {
+    final kb = utf8.encode(k);
+    if (kb.length <= 64) b.add(_iptcRec(2, 25, kb)); // Keywords
+  }
+  final iptc = b.toBytes();
+  final out = BytesBuilder();
+  out.add(ascii.encode('Photoshop 3.0'));
+  out.addByte(0);
+  out.add(ascii.encode('8BIM'));
+  out.add([0x04, 0x04, 0x00, 0x00]);
+  out.add([
+    (iptc.length >> 24) & 0xff,
+    (iptc.length >> 16) & 0xff,
+    (iptc.length >> 8) & 0xff,
+    iptc.length & 0xff,
+  ]);
+  out.add(iptc);
+  if (iptc.length.isOdd) out.addByte(0);
+  return out.toBytes();
+}
+
+List<int> _buildXmp(String title, List<String> kws) {
+  final t = _xmlEsc(title);
+  final li = kws.map((k) => '<rdf:li>${_xmlEsc(k)}</rdf:li>').join();
+  final x = '<?xpacket begin="\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+      '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+      '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+      '<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" '
+      'xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/">'
+      '<dc:title><rdf:Alt><rdf:li xml:lang="x-default">$t</rdf:li></rdf:Alt></dc:title>'
+      '<dc:description><rdf:Alt><rdf:li xml:lang="x-default">$t</rdf:li></rdf:Alt></dc:description>'
+      '<dc:subject><rdf:Bag>$li</rdf:Bag></dc:subject>'
+      '<photoshop:Headline>$t</photoshop:Headline>'
+      '</rdf:Description></rdf:RDF></x:xmpmeta>\n'
+      '<?xpacket end="w"?>';
+  return utf8.encode(x);
+}
+
+Uint8List embedJpegMetadata(Uint8List data, String title, List<String> kws) {
+  if (data.length < 4 || data[0] != 0xff || data[1] != 0xd8) {
+    throw Exception('Bukan file JPEG');
+  }
+  final xmpHead = ascii.encode('http://ns.adobe.com/xap/1.0/\x00');
+  final psHead = ascii.encode('Photoshop 3.0\x00');
+  const exifHead = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00];
+
+  var pos = 2;
+  var head = true;
+  final keepHead = BytesBuilder();
+  final keepTail = BytesBuilder();
+  while (pos + 4 <= data.length && data[pos] == 0xff) {
+    final m = data[pos + 1];
+    if (m == 0xff) {
+      pos++;
+      continue;
+    }
+    if (m == 0xda) break; // mulai data gambar
+    final len = (data[pos + 2] << 8) | data[pos + 3];
+    final end = pos + 2 + len;
+    if (len < 2 || end > data.length) throw Exception('Struktur JPEG rusak');
+    final isXmp = m == 0xe1 && _hasPrefix(data, pos + 4, xmpHead);
+    final isPs = m == 0xed && _hasPrefix(data, pos + 4, psHead);
+    final isHead =
+        head && (m == 0xe0 || (m == 0xe1 && _hasPrefix(data, pos + 4, exifHead)));
+    if (!isXmp && !isPs) {
+      if (isHead) {
+        keepHead.add(data.sublist(pos, end));
+      } else {
+        head = false;
+        keepTail.add(data.sublist(pos, end));
+      }
+    }
+    pos = end;
+  }
+
+  final out = BytesBuilder();
+  out.add([0xff, 0xd8]);
+  out.add(keepHead.toBytes());
+  out.add(_segment(0xed, _buildApp13(title, kws)));
+  out.add(_segment(0xe1, [...xmpHead, ..._buildXmp(title, kws)]));
+  out.add(keepTail.toBytes());
+  out.add(data.sublist(pos));
+  return out.toBytes();
 }
 
 class Processor {
@@ -642,7 +766,31 @@ Rules:
       }
     }
     log('  ✔ ${moved ? "Dipindah" : "Disalin"} → $name');
+    if (s.embed) await _embed(dest, m);
     if (s.csv) await _appendCsv(out, name, m);
+  }
+
+  bool _warnedNoEmbed = false;
+
+  Future<void> _embed(String path, Meta m) async {
+    final ext = p.extension(path).toLowerCase();
+    if (ext != '.jpg' && ext != '.jpeg') {
+      if (!_warnedNoEmbed) {
+        _warnedNoEmbed = true;
+        log('  ℹ Metadata hanya ditanam ke JPG. Video/PNG/WebP memakai CSV.');
+      }
+      return;
+    }
+    try {
+      final data = await File(path).readAsBytes();
+      final out = embedJpegMetadata(data, m.title, m.keywords);
+      final tmp = File('$path.tmp');
+      await tmp.writeAsBytes(out, flush: true);
+      await tmp.rename(path);
+      log('  ✔ Metadata tertanam di file (IPTC + XMP)');
+    } catch (e) {
+      log('  ⚠ Gagal menanam metadata: $e');
+    }
   }
 
   Future<void> _appendCsv(Directory out, String filename, Meta m) async {
@@ -689,3 +837,4 @@ Rules:
     log('Cek key selesai.');
   }
 }
+
