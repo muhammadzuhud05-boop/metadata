@@ -188,6 +188,28 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> _checkFile() async {
+    final r = await FilePicker.platform.pickFiles(type: FileType.any, allowMultiple: false);
+    if (r == null || r.files.isEmpty || r.files.first.path == null) return;
+    final f = File(r.files.first.path!);
+    _log('── Periksa metadata: ${p.basename(f.path)}');
+    try {
+      final m = readJpegMetadata(await f.readAsBytes());
+      _log('  XMP  judul   : ${m.xmpTitle ?? "(kosong)"}');
+      _log('  XMP  keyword : ${m.xmpKeywords.length}');
+      _log('  IPTC judul   : ${m.iptcTitle ?? "(kosong)"}');
+      _log('  IPTC keyword : ${m.iptcKeywords.length}');
+      if (m.xmpKeywords.isNotEmpty) {
+        _log('  Contoh: ${m.xmpKeywords.take(8).join(", ")}');
+      }
+    } catch (e) {
+      _log('  ✖ $e');
+    }
+    try {
+      f.deleteSync(); // salinan sementara di cache, bukan file asli
+    } catch (_) {}
+  }
+
   void _resetSelection() {
     setState(() {
       folderSel = {};
@@ -480,6 +502,12 @@ class _HomePageState extends State<HomePage> {
               _switch('Export CSV Adobe Stock', s.csv, (v) => s.csv = v),
               _switch('Auto retry', s.retry, (v) => s.retry = v),
             ]),
+            OutlinedButton.icon(
+              onPressed: running ? null : _checkFile,
+              icon: const Icon(Icons.fact_check_outlined),
+              label: const Text('Periksa metadata file JPG'),
+            ),
+            const SizedBox(height: 12),
             Row(children: [
               Expanded(
                 child: FilledButton.icon(
