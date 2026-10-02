@@ -476,6 +476,7 @@ class _HomePageState extends State<HomePage> {
               ]),
               _switch('Rename file sesuai judul', s.rename, (v) => s.rename = v),
               _switch('Pindah ke output (mati = salin)', s.move, (v) => s.move = v),
+              _switch('Tanam metadata ke foto JPG', s.embed, (v) => s.embed = v),
               _switch('Export CSV Adobe Stock', s.csv, (v) => s.csv = v),
               _switch('Auto retry', s.retry, (v) => s.retry = v),
             ]),
