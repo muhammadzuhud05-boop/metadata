@@ -214,8 +214,8 @@ List<int> _buildApp13(String title, List<String> kws) {
   final b = BytesBuilder();
   b.add(_iptcRec(1, 0x5a, [0x1b, 0x25, 0x47])); // UTF-8
   b.add(_iptcRec(2, 0, [0x00, 0x04]));
-  b.add(_iptcRec(2, 5, t)); // Object Name (judul)
-  b.add(_iptcRec(2, 105, t)); // Headline
+  b.add(_iptcRec(2, 5, utf8.encode(_clipBytes(title, 64)))); // Object Name (batas standar 64 byte)
+  b.add(_iptcRec(2, 105, utf8.encode(_clipBytes(title, 256)))); // Headline
   b.add(_iptcRec(2, 120, t)); // Caption/Abstract
   for (final k in kws) {
     final kb = utf8.encode(k);
@@ -300,6 +300,113 @@ Uint8List embedJpegMetadata(Uint8List data, String title, List<String> kws) {
   out.add(keepTail.toBytes());
   out.add(data.sublist(pos));
   return out.toBytes();
+}
+
+String _clipBytes(String s, int max) {
+  if (utf8.encode(s).length <= max) return s;
+  var out = '';
+  for (final r in s.runes) {
+    final c = String.fromCharCode(r);
+    if (utf8.encode(out + c).length > max) break;
+    out += c;
+  }
+  final cut = out.lastIndexOf(' ');
+  return (cut > 30 ? out.substring(0, cut) : out).trimRight();
+}
+
+String _xmlUnesc(String s) => s
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&amp;', '&');
+
+/// Hasil pembacaan metadata dari file JPEG.
+class JpegMeta {
+  String? iptcTitle;
+  List<String> iptcKeywords = [];
+  String? xmpTitle;
+  List<String> xmpKeywords = [];
+}
+
+void _readIptc(Uint8List d, int start, int end, JpegMeta r) {
+  var j = start;
+  while (j + 5 <= end && d[j] == 0x1c) {
+    final rec = d[j + 1];
+    final ds = d[j + 2];
+    final l = (d[j + 3] << 8) | d[j + 4];
+    if (l & 0x8000 != 0 || j + 5 + l > end) break;
+    if (rec == 2 && (ds == 5 || ds == 25)) {
+      final v = utf8.decode(d.sublist(j + 5, j + 5 + l), allowMalformed: true);
+      if (ds == 5) {
+        r.iptcTitle = v;
+      } else {
+        r.iptcKeywords.add(v);
+      }
+    }
+    j += 5 + l;
+  }
+}
+
+void _readIrb(Uint8List d, int start, int end, JpegMeta r) {
+  var i = start;
+  while (i + 12 <= end && _hasPrefix(d, i, const [0x38, 0x42, 0x49, 0x4d])) {
+    final id = (d[i + 4] << 8) | d[i + 5];
+    final nameLen = d[i + 6];
+    final nameTotal = (1 + nameLen).isOdd ? 2 + nameLen : 1 + nameLen;
+    final sizePos = i + 6 + nameTotal;
+    if (sizePos + 4 > end) break;
+    final size = (d[sizePos] << 24) |
+        (d[sizePos + 1] << 16) |
+        (d[sizePos + 2] << 8) |
+        d[sizePos + 3];
+    final dataStart = sizePos + 4;
+    final dataEnd = dataStart + size;
+    if (dataEnd > end) break;
+    if (id == 0x0404) _readIptc(d, dataStart, dataEnd, r);
+    i = dataEnd + (size.isOdd ? 1 : 0);
+  }
+}
+
+JpegMeta readJpegMetadata(Uint8List data) {
+  if (data.length < 4 || data[0] != 0xff || data[1] != 0xd8) {
+    throw Exception('Bukan file JPEG');
+  }
+  final r = JpegMeta();
+  final xmpHead = ascii.encode('http://ns.adobe.com/xap/1.0/\x00');
+  final psHead = ascii.encode('Photoshop 3.0\x00');
+  var pos = 2;
+  while (pos + 4 <= data.length && data[pos] == 0xff) {
+    final m = data[pos + 1];
+    if (m == 0xff) {
+      pos++;
+      continue;
+    }
+    if (m == 0xda) break;
+    final len = (data[pos + 2] << 8) | data[pos + 3];
+    final end = pos + 2 + len;
+    if (len < 2 || end > data.length) break;
+    if (m == 0xe1 && _hasPrefix(data, pos + 4, xmpHead)) {
+      final xml = utf8.decode(
+        data.sublist(pos + 4 + xmpHead.length, end),
+        allowMalformed: true,
+      );
+      final t = RegExp(r'<dc:title>.*?<rdf:li[^>]*>(.*?)</rdf:li>', dotAll: true)
+          .firstMatch(xml);
+      if (t != null) r.xmpTitle = _xmlUnesc(t.group(1)!);
+      final sb = RegExp(r'<dc:subject>(.*?)</dc:subject>', dotAll: true).firstMatch(xml);
+      if (sb != null) {
+        r.xmpKeywords = RegExp(r'<rdf:li[^>]*>(.*?)</rdf:li>', dotAll: true)
+            .allMatches(sb.group(1)!)
+            .map((e) => _xmlUnesc(e.group(1)!))
+            .toList();
+      }
+    } else if (m == 0xed && _hasPrefix(data, pos + 4, psHead)) {
+      _readIrb(data, pos + 4 + psHead.length, end, r);
+    }
+    pos = end;
+  }
+  return r;
 }
 
 class Processor {
@@ -787,7 +894,11 @@ Rules:
       final tmp = File('$path.tmp');
       await tmp.writeAsBytes(out, flush: true);
       await tmp.rename(path);
-      log('  ✔ Metadata tertanam di file (IPTC + XMP)');
+      final chk = readJpegMetadata(await File(path).readAsBytes());
+      final okTitle = chk.xmpTitle == m.title;
+      log(okTitle && chk.xmpKeywords.isNotEmpty
+          ? '  ✔ Metadata tertanam dan terbaca ulang: judul + ${chk.xmpKeywords.length} keyword (XMP), ${chk.iptcKeywords.length} keyword (IPTC)'
+          : '  ⚠ Metadata ditulis tapi gagal dibaca ulang (judul XMP: ${chk.xmpTitle ?? "kosong"})');
     } catch (e) {
       log('  ⚠ Gagal menanam metadata: $e');
     }
@@ -837,4 +948,3 @@ Rules:
     log('Cek key selesai.');
   }
 }
-
