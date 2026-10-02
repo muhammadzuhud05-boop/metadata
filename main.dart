@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -43,6 +46,7 @@ class _HomePageState extends State<HomePage> {
   final s = Settings();
   final keysCtrl = TextEditingController();
   final modelCtrl = TextEditingController();
+  final baseCtrl = TextEditingController();
   final logScroll = ScrollController();
   final logs = <String>[];
 
@@ -50,6 +54,11 @@ class _HomePageState extends State<HomePage> {
   bool running = false;
   int ok = 0, fail = 0, total = 0;
   Processor? proc;
+
+  // Sumber file
+  List<File> folderFiles = []; // isi folder input
+  Set<String> folderSel = {}; // subset yang dipilih (kosong = semua)
+  List<File> picked = []; // file yang dipilih lewat pemilih file
 
   @override
   void initState() {
@@ -61,6 +70,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     keysCtrl.dispose();
     modelCtrl.dispose();
+    baseCtrl.dispose();
     logScroll.dispose();
     super.dispose();
   }
@@ -69,13 +79,28 @@ class _HomePageState extends State<HomePage> {
     await s.load();
     keysCtrl.text = s.keys;
     modelCtrl.text = s.model;
+    baseCtrl.text = s.customBase;
+    if (s.inputDir.isNotEmpty) folderFiles = Processor.scanFolder(s.inputDir);
     if (mounted) setState(() => loaded = true);
   }
 
   Future<void> _save() async {
     s.keys = keysCtrl.text;
-    s.model = modelCtrl.text.trim().isEmpty ? 'gemini-3.6-flash' : modelCtrl.text.trim();
+    final m = modelCtrl.text.trim();
+    s.model = m.isEmpty ? providerOf(s.provider).defaultModel : m;
+    s.customBase = baseCtrl.text.trim();
     await s.save();
+  }
+
+  Future<void> _changeProvider(String id) async {
+    await _save();
+    s.provider = id;
+    await s.loadProviderFields();
+    keysCtrl.text = s.keys;
+    modelCtrl.text = s.model;
+    baseCtrl.text = s.customBase;
+    await s.save();
+    if (mounted) setState(() {});
   }
 
   void _log(String m) {
@@ -101,7 +126,9 @@ class _HomePageState extends State<HomePage> {
     return false;
   }
 
-  Future<void> _pickDir(bool input) async {
+  // ------------------------------------------------------- pilih sumber
+
+  Future<void> _pickFolder() async {
     if (!await _ensureStorage()) {
       _log('✖ Aktifkan "Akses semua file" untuk aplikasi ini, lalu pilih folder lagi.');
       return;
@@ -109,18 +136,80 @@ class _HomePageState extends State<HomePage> {
     final d = await FilePicker.platform.getDirectoryPath();
     if (d == null) return;
     setState(() {
-      if (input) {
-        s.inputDir = d;
-      } else {
-        s.outputDir = d;
-      }
+      s.inputDir = d;
+      folderFiles = Processor.scanFolder(d);
+      folderSel = {};
+      picked = [];
     });
     await _save();
+    if (folderFiles.isEmpty) {
+      _log('Folder ini tidak berisi foto/video yang didukung (jpg, png, webp, mp4, mov).');
+    }
   }
+
+  Future<void> _pickFiles() async {
+    final r = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      type: FileType.media,
+    );
+    if (r == null) return;
+    final list = <File>[
+      for (final f in r.files)
+        if (f.path != null && Processor.isMedia(f.path!)) File(f.path!),
+    ];
+    if (list.isEmpty) {
+      _log('Tidak ada foto/video yang didukung pada pilihan tadi.');
+      return;
+    }
+    setState(() {
+      picked = list;
+      folderSel = {};
+    });
+  }
+
+  Future<void> _chooseFromFolder() async {
+    if (s.inputDir.isNotEmpty) {
+      setState(() => folderFiles = Processor.scanFolder(s.inputDir));
+    }
+    if (folderFiles.isEmpty) {
+      _log('Pilih folder yang berisi foto/video dulu.');
+      return;
+    }
+    final res = await showModalBottomSheet<Set<String>>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => _SelectSheet(files: folderFiles, initial: folderSel),
+    );
+    if (res != null) {
+      setState(() {
+        folderSel = res.length == folderFiles.length ? {} : res;
+        picked = [];
+      });
+    }
+  }
+
+  void _resetSelection() {
+    setState(() {
+      folderSel = {};
+      picked = [];
+    });
+  }
+
+  String get _sourceText {
+    if (picked.isNotEmpty) {
+      return '${picked.length} file dipilih manual. File asli tidak dihapus, hasilnya disalin ke output.';
+    }
+    if (s.inputDir.isEmpty) return 'Belum ada sumber. Pilih folder atau pilih file.';
+    final n = folderFiles.length;
+    if (folderSel.isNotEmpty) return '${folderSel.length} dari $n file di folder dipilih.';
+    return 'Semua $n file di folder akan diproses.';
+  }
+
+  // ------------------------------------------------------------- proses
 
   Future<void> _checkKeys() async {
     await _save();
-    await Processor.checkKeys(s.keyList, s.model, _log);
+    await Processor(s, _log, (a, b, c) {}).checkKeys();
   }
 
   Future<void> _start() async {
@@ -129,6 +218,19 @@ class _HomePageState extends State<HomePage> {
       _log('✖ Izin akses penyimpanan belum diberikan. Aktifkan "Akses semua file" lalu tekan Mulai lagi.');
       return;
     }
+    if (s.inputDir.isNotEmpty) {
+      folderFiles = Processor.scanFolder(s.inputDir);
+    }
+
+    List<File>? files;
+    var fromPicker = false;
+    if (picked.isNotEmpty) {
+      files = picked;
+      fromPicker = true;
+    } else if (folderSel.isNotEmpty) {
+      files = folderFiles.where((f) => folderSel.contains(f.path)).toList();
+    }
+
     setState(() {
       running = true;
       ok = 0;
@@ -137,22 +239,37 @@ class _HomePageState extends State<HomePage> {
       logs.clear();
     });
     await WakelockPlus.enable();
-    proc = Processor(s, _log, (o, f, t) {
-      if (mounted) {
-        setState(() {
-          ok = o;
-          fail = f;
-          total = t;
-        });
-      }
-    });
+    proc = Processor(
+      s,
+      _log,
+      (o, f, t) {
+        if (mounted) {
+          setState(() {
+            ok = o;
+            fail = f;
+            total = t;
+          });
+        }
+      },
+      files: files,
+      fromPicker: fromPicker,
+    );
     try {
       await proc!.run();
     } catch (e) {
       _log('✖ Error tak terduga: $e');
     }
     await WakelockPlus.disable();
-    if (mounted) setState(() => running = false);
+    if (mounted) {
+      setState(() {
+        running = false;
+        if (fromPicker) picked = [];
+        if (s.inputDir.isNotEmpty) {
+          folderFiles = Processor.scanFolder(s.inputDir);
+          folderSel = folderSel.where((x) => File(x).existsSync()).toSet();
+        }
+      });
+    }
   }
 
   void _stop() {
@@ -167,6 +284,7 @@ class _HomePageState extends State<HomePage> {
     if (!loaded) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
+    final info = providerOf(s.provider);
     final done = ok + fail;
     return Scaffold(
       appBar: AppBar(
@@ -177,7 +295,48 @@ class _HomePageState extends State<HomePage> {
         child: ListView(
           padding: const EdgeInsets.fromLTRB(12, 4, 12, 24),
           children: [
-            _section('API Key Gemini', [
+            _section('Penyedia AI dan API key', [
+              InputDecorator(
+                decoration: const InputDecoration(
+                  labelText: 'Penyedia',
+                  border: OutlineInputBorder(),
+                  contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: s.provider,
+                    isExpanded: true,
+                    isDense: true,
+                    items: [
+                      for (final x in providers)
+                        DropdownMenuItem(value: x.id, child: Text(x.label)),
+                    ],
+                    onChanged: running
+                        ? null
+                        : (v) {
+                            if (v != null && v != s.provider) _changeProvider(v);
+                          },
+                  ),
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Key gratis: ${info.keyHelp}',
+                style: const TextStyle(fontSize: 12, color: Color(0xFF9DB5A8)),
+              ),
+              const SizedBox(height: 8),
+              if (s.provider == 'custom') ...[
+                TextField(
+                  controller: baseCtrl,
+                  enabled: !running,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: 'Alamat API (contoh: https://api.together.xyz/v1)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
               TextField(
                 controller: keysCtrl,
                 enabled: !running,
@@ -194,7 +353,7 @@ class _HomePageState extends State<HomePage> {
                 controller: modelCtrl,
                 enabled: !running,
                 decoration: const InputDecoration(
-                  labelText: 'Model',
+                  labelText: 'Model (harus bisa membaca gambar)',
                   border: OutlineInputBorder(),
                 ),
               ),
@@ -222,10 +381,68 @@ class _HomePageState extends State<HomePage> {
                 ),
               ]),
             ]),
-            _section('Folder', [
-              _dirTile('Folder input (foto/video)', s.inputDir, () => _pickDir(true)),
-              const SizedBox(height: 6),
-              _dirTile('Folder output', s.outputDir, () => _pickDir(false)),
+            _section('Sumber file', [
+              Row(children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: running ? null : _pickFolder,
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text('Pilih folder'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: running ? null : _pickFiles,
+                    icon: const Icon(Icons.photo_library_outlined),
+                    label: const Text('Pilih file'),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: running || picked.isNotEmpty ? null : _chooseFromFolder,
+                    icon: const Icon(Icons.checklist),
+                    label: const Text('Pilih sebagian'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: running ? null : _resetSelection,
+                    icon: const Icon(Icons.restart_alt),
+                    label: const Text('Semua file'),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 8),
+              if (s.inputDir.isNotEmpty && picked.isEmpty)
+                Text('Folder: ${s.inputDir}',
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF9DB5A8))),
+              Text(_sourceText),
+              const SizedBox(height: 4),
+              const Text(
+                'Pilih folder: file dipindah atau disalin langsung. Pilih file: dipilih dari galeri, file asli aman.',
+                style: TextStyle(fontSize: 11, color: Color(0xFF7F978A)),
+              ),
+            ]),
+            _section('Folder output', [
+              _dirTile(
+                'Hasil rename dan CSV disimpan di',
+                s.outputDir,
+                () async {
+                  if (!await _ensureStorage()) {
+                    _log('✖ Aktifkan "Akses semua file" untuk aplikasi ini, lalu pilih folder lagi.');
+                    return;
+                  }
+                  final d = await FilePicker.platform.getDirectoryPath();
+                  if (d == null) return;
+                  setState(() => s.outputDir = d);
+                  await _save();
+                },
+              ),
             ]),
             _section('Pengaturan', [
               Text('Jumlah keyword: ${s.keywordCount}'),
@@ -408,6 +625,99 @@ class _HomePageState extends State<HomePage> {
       title: Text(label),
       value: value,
       onChanged: running ? null : (v) => setState(() => set(v)),
+    );
+  }
+}
+
+/// Daftar centang untuk memilih sebagian file dari folder input.
+class _SelectSheet extends StatefulWidget {
+  const _SelectSheet({required this.files, required this.initial});
+
+  final List<File> files;
+  final Set<String> initial;
+
+  @override
+  State<_SelectSheet> createState() => _SelectSheetState();
+}
+
+class _SelectSheetState extends State<_SelectSheet> {
+  late Set<String> sel = {...widget.initial};
+
+  String _size(File f) {
+    try {
+      final b = f.lengthSync();
+      if (b >= 1024 * 1024) return '${(b / (1024 * 1024)).toStringAsFixed(1)} MB';
+      return '${(b / 1024).toStringAsFixed(0)} KB';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: SizedBox(
+        height: MediaQuery.of(context).size.height * 0.85,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+              child: Row(children: [
+                Expanded(
+                  child: Text(
+                    '${sel.length} dari ${widget.files.length} dipilih',
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => setState(() {
+                    sel = widget.files.map((f) => f.path).toSet();
+                  }),
+                  child: const Text('Semua'),
+                ),
+                TextButton(
+                  onPressed: () => setState(() => sel = <String>{}),
+                  child: const Text('Kosongkan'),
+                ),
+              ]),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: ListView.builder(
+                itemCount: widget.files.length,
+                itemBuilder: (_, i) {
+                  final f = widget.files[i];
+                  return CheckboxListTile(
+                    dense: true,
+                    value: sel.contains(f.path),
+                    title: Text(
+                      p.basename(f.path),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(_size(f)),
+                    onChanged: (v) => setState(() {
+                      if (v == true) {
+                        sel.add(f.path);
+                      } else {
+                        sel.remove(f.path);
+                      }
+                    }),
+                  );
+                },
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: FilledButton(
+                onPressed: () => Navigator.pop(context, sel),
+                style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(46)),
+                child: const Text('Selesai'),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
