@@ -53,11 +53,11 @@ class _HomePageState extends State<HomePage> {
   bool loaded = false;
   bool running = false;
   int ok = 0, fail = 0, total = 0;
+  bool modelBusy = false;
   Processor? proc;
 
   // Sumber file
   List<File> folderFiles = []; // isi folder input
-  Set<String> folderSel = {}; // subset yang dipilih (kosong = semua)
   List<File> picked = []; // file yang dipilih lewat pemilih file
 
   @override
@@ -86,8 +86,7 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _save() async {
     s.keys = keysCtrl.text;
-    final m = modelCtrl.text.trim();
-    s.model = m.isEmpty ? providerOf(s.provider).defaultModel : m;
+    if (s.provider == 'custom') s.model = modelCtrl.text.trim();
     s.customBase = baseCtrl.text.trim();
     await s.save();
   }
@@ -138,7 +137,6 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       s.inputDir = d;
       folderFiles = Processor.scanFolder(d);
-      folderSel = {};
       picked = [];
     });
     await _save();
@@ -163,29 +161,7 @@ class _HomePageState extends State<HomePage> {
     }
     setState(() {
       picked = list;
-      folderSel = {};
     });
-  }
-
-  Future<void> _chooseFromFolder() async {
-    if (s.inputDir.isNotEmpty) {
-      setState(() => folderFiles = Processor.scanFolder(s.inputDir));
-    }
-    if (folderFiles.isEmpty) {
-      _log('Pilih folder yang berisi foto/video dulu.');
-      return;
-    }
-    final res = await showModalBottomSheet<Set<String>>(
-      context: context,
-      isScrollControlled: true,
-      builder: (_) => _SelectSheet(files: folderFiles, initial: folderSel),
-    );
-    if (res != null) {
-      setState(() {
-        folderSel = res.length == folderFiles.length ? {} : res;
-        picked = [];
-      });
-    }
   }
 
   Future<void> _checkFile() async {
@@ -217,21 +193,117 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
-  void _resetSelection() {
+  Future<void> _resetSource() async {
     setState(() {
-      folderSel = {};
       picked = [];
+      folderFiles = [];
+      s.inputDir = '';
     });
+    await _save();
   }
 
   String get _sourceText {
     if (picked.isNotEmpty) {
-      return '${picked.length} file dipilih manual. File asli tidak dihapus, hasilnya disalin ke output.';
+      return '${picked.length} file dipilih. File asli tidak dihapus, hasilnya disalin ke output.';
     }
-    if (s.inputDir.isEmpty) return 'Belum ada sumber. Pilih folder atau pilih file.';
-    final n = folderFiles.length;
-    if (folderSel.isNotEmpty) return '${folderSel.length} dari $n file di folder dipilih.';
-    return 'Semua $n file di folder akan diproses.';
+    if (s.inputDir.isEmpty) return 'Belum ada sumber. Pilih file atau pilih folder.';
+    return 'Semua ${folderFiles.length} file di folder akan diproses.';
+  }
+
+  // ------------------------------------------------------------- model
+
+  List<ModelOpt> _modelItems() {
+    final byId = <String, ModelOpt>{};
+    for (final x in s.modelsFor(s.provider)) {
+      byId.putIfAbsent(x.id, () => x);
+    }
+    if (s.model.isNotEmpty && !byId.containsKey(s.model)) {
+      return [ModelOpt(s.model, 'tersimpan'), ...byId.values];
+    }
+    return byId.values.toList();
+  }
+
+  Future<void> _refreshModels() async {
+    await _save();
+    final prov = s.provider;
+    final keys = s.keyList;
+    if (prov != 'openrouter' && keys.isEmpty) {
+      _log('✖ Isi API key dulu untuk memperbarui daftar model ${providerOf(prov).label}.');
+      return;
+    }
+    setState(() => modelBusy = true);
+    try {
+      final list = await fetchModels(prov, keys.isEmpty ? '' : keys.first);
+      if (list.isEmpty) {
+        _log('Tidak ditemukan model yang bisa membaca gambar. Daftar bawaan tetap dipakai.');
+      } else {
+        await s.saveModels(prov, list);
+        if (!list.any((x) => x.id == s.model)) {
+          s.model = list.first.id;
+          await s.save();
+          _log('Model diganti ke ${s.model} karena model sebelumnya tidak ada di daftar baru.');
+        }
+        _log('✔ ${providerOf(prov).label}: ${list.length} model yang bisa membaca gambar.');
+      }
+    } catch (e) {
+      _log('✖ Gagal memperbarui daftar model: $e');
+    }
+    if (mounted) setState(() => modelBusy = false);
+  }
+
+  Widget _modelDropdown() {
+    final items = _modelItems();
+    return InputDecorator(
+      decoration: const InputDecoration(
+        labelText: 'Model (otomatis, bisa membaca gambar)',
+        border: OutlineInputBorder(),
+        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: s.model,
+          isExpanded: true,
+          itemHeight: null,
+          selectedItemBuilder: (_) => [
+            for (final x in items)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(x.id, overflow: TextOverflow.ellipsis),
+              ),
+          ],
+          items: [
+            for (final x in items)
+              DropdownMenuItem<String>(
+                value: x.id,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(x.id, overflow: TextOverflow.ellipsis),
+                      if (x.note.isNotEmpty)
+                        Text(
+                          x.note,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 11, color: Color(0xFF9DB5A8)),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+          onChanged: running
+              ? null
+              : (v) async {
+                  if (v == null) return;
+                  setState(() => s.model = v);
+                  await _save();
+                },
+        ),
+      ),
+    );
   }
 
   // ------------------------------------------------------------- proses
@@ -256,8 +328,6 @@ class _HomePageState extends State<HomePage> {
     if (picked.isNotEmpty) {
       files = picked;
       fromPicker = true;
-    } else if (folderSel.isNotEmpty) {
-      files = folderFiles.where((f) => folderSel.contains(f.path)).toList();
     }
 
     setState(() {
@@ -295,7 +365,6 @@ class _HomePageState extends State<HomePage> {
         if (fromPicker) picked = [];
         if (s.inputDir.isNotEmpty) {
           folderFiles = Processor.scanFolder(s.inputDir);
-          folderSel = folderSel.where((x) => File(x).existsSync()).toSet();
         }
       });
     }
@@ -378,14 +447,32 @@ class _HomePageState extends State<HomePage> {
                 style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
               ),
               const SizedBox(height: 8),
-              TextField(
-                controller: modelCtrl,
-                enabled: !running,
-                decoration: const InputDecoration(
-                  labelText: 'Model (harus bisa membaca gambar)',
-                  border: OutlineInputBorder(),
+              if (s.provider == 'custom')
+                TextField(
+                  controller: modelCtrl,
+                  enabled: !running,
+                  decoration: const InputDecoration(
+                    labelText: 'Nama model (harus bisa membaca gambar)',
+                    border: OutlineInputBorder(),
+                  ),
+                )
+              else ...[
+                _modelDropdown(),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    onPressed: running || modelBusy ? null : _refreshModels,
+                    icon: modelBusy
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.refresh, size: 18),
+                    label: const Text('Perbarui daftar model'),
+                  ),
                 ),
-              ),
+              ],
               const SizedBox(height: 8),
               Row(children: [
                 Expanded(
@@ -413,36 +500,26 @@ class _HomePageState extends State<HomePage> {
             _section('Sumber file', [
               Row(children: [
                 Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: running ? null : _pickFolder,
-                    icon: const Icon(Icons.folder_open),
-                    label: const Text('Pilih folder'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 4)),
                     onPressed: running ? null : _pickFiles,
-                    icon: const Icon(Icons.photo_library_outlined),
-                    label: const Text('Pilih file'),
-                  ),
-                ),
-              ]),
-              const SizedBox(height: 8),
-              Row(children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: running || picked.isNotEmpty ? null : _chooseFromFolder,
-                    icon: const Icon(Icons.checklist),
-                    label: const Text('Pilih sebagian'),
+                    child: const Text('Pilih file'),
                   ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: running ? null : _resetSelection,
-                    icon: const Icon(Icons.restart_alt),
-                    label: const Text('Semua file'),
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 4)),
+                    onPressed: running ? null : _pickFolder,
+                    child: const Text('Pilih folder'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 4)),
+                    onPressed: running ? null : _resetSource,
+                    child: const Text('Reset'),
                   ),
                 ),
               ]),
@@ -453,7 +530,7 @@ class _HomePageState extends State<HomePage> {
               Text(_sourceText),
               const SizedBox(height: 4),
               const Text(
-                'Pilih folder: file dipindah atau disalin langsung. Pilih file: dipilih dari galeri, file asli aman.',
+                'Pilih file: dari galeri, file asli aman. Pilih folder: semua file di folder diproses, lalu dipindah atau disalin.',
                 style: TextStyle(fontSize: 11, color: Color(0xFF7F978A)),
               ),
             ]),
@@ -661,99 +738,6 @@ class _HomePageState extends State<HomePage> {
       title: Text(label),
       value: value,
       onChanged: running ? null : (v) => setState(() => set(v)),
-    );
-  }
-}
-
-/// Daftar centang untuk memilih sebagian file dari folder input.
-class _SelectSheet extends StatefulWidget {
-  const _SelectSheet({required this.files, required this.initial});
-
-  final List<File> files;
-  final Set<String> initial;
-
-  @override
-  State<_SelectSheet> createState() => _SelectSheetState();
-}
-
-class _SelectSheetState extends State<_SelectSheet> {
-  late Set<String> sel = {...widget.initial};
-
-  String _size(File f) {
-    try {
-      final b = f.lengthSync();
-      if (b >= 1024 * 1024) return '${(b / (1024 * 1024)).toStringAsFixed(1)} MB';
-      return '${(b / 1024).toStringAsFixed(0)} KB';
-    } catch (_) {
-      return '';
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: SizedBox(
-        height: MediaQuery.of(context).size.height * 0.85,
-        child: Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
-              child: Row(children: [
-                Expanded(
-                  child: Text(
-                    '${sel.length} dari ${widget.files.length} dipilih',
-                    style: const TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                ),
-                TextButton(
-                  onPressed: () => setState(() {
-                    sel = widget.files.map((f) => f.path).toSet();
-                  }),
-                  child: const Text('Semua'),
-                ),
-                TextButton(
-                  onPressed: () => setState(() => sel = <String>{}),
-                  child: const Text('Kosongkan'),
-                ),
-              ]),
-            ),
-            const Divider(height: 1),
-            Expanded(
-              child: ListView.builder(
-                itemCount: widget.files.length,
-                itemBuilder: (_, i) {
-                  final f = widget.files[i];
-                  return CheckboxListTile(
-                    dense: true,
-                    value: sel.contains(f.path),
-                    title: Text(
-                      p.basename(f.path),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    subtitle: Text(_size(f)),
-                    onChanged: (v) => setState(() {
-                      if (v == true) {
-                        sel.add(f.path);
-                      } else {
-                        sel.remove(f.path);
-                      }
-                    }),
-                  );
-                },
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(12),
-              child: FilledButton(
-                onPressed: () => Navigator.pop(context, sel),
-                style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(46)),
-                child: const Text('Selesai'),
-              ),
-            ),
-          ],
-        ),
-      ),
     );
   }
 }
