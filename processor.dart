@@ -13,26 +13,62 @@ import 'package:video_thumbnail/video_thumbnail.dart';
 const photoExt = {'.jpg', '.jpeg', '.png', '.webp'};
 const videoExt = {'.mp4', '.mov', '.m4v'};
 
+/// Satu pilihan model di daftar.
+class ModelOpt {
+  const ModelOpt(this.id, [this.note = '']);
+  final String id;
+  final String note;
+}
+
+ModelOpt _optFromString(String e) {
+  final i = e.indexOf('\t');
+  return i < 0 ? ModelOpt(e) : ModelOpt(e.substring(0, i), e.substring(i + 1));
+}
+
 /// Penyedia AI yang didukung.
 class ProviderInfo {
-  const ProviderInfo(this.id, this.label, this.base, this.defaultModel, this.keyHelp);
+  const ProviderInfo(
+    this.id,
+    this.label,
+    this.base,
+    this.defaultModel,
+    this.keyHelp,
+    this.models,
+  );
   final String id;
   final String label;
   final String base; // alamat dasar API gaya OpenAI (kosong untuk Gemini/Kustom)
   final String defaultModel;
   final String keyHelp;
+  final List<ModelOpt> models; // daftar bawaan, bisa diperbarui lewat tombol di aplikasi
 }
 
 const providers = <ProviderInfo>[
-  ProviderInfo('gemini', 'Gemini', '', 'gemini-3.6-flash', 'aistudio.google.com/apikey'),
-  ProviderInfo('openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1',
-      'google/gemma-3-27b-it:free', 'openrouter.ai/keys'),
-  ProviderInfo('groq', 'Groq', 'https://api.groq.com/openai/v1',
-      'meta-llama/llama-4-scout-17b-16e-instruct', 'console.groq.com/keys'),
+  ProviderInfo('gemini', 'Gemini', '', 'gemini-3.6-flash', 'aistudio.google.com/apikey', [
+    ModelOpt('gemini-3.6-flash', 'seimbang, gratis dengan batas harian'),
+    ModelOpt('gemini-3.8-flash', 'terbaru, gratis dengan batas harian'),
+    ModelOpt('gemini-3.7-flash', 'gratis dengan batas harian'),
+    ModelOpt('gemini-3.5-flash', 'gratis dengan batas harian'),
+    ModelOpt('gemini-3.5-flash-lite', 'hemat, cocok untuk batch besar'),
+    ModelOpt('gemini-3.1-flash-lite', 'hemat'),
+  ]),
+  ProviderInfo('openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1', 'openrouter/free',
+      'openrouter.ai/keys', [
+    ModelOpt('openrouter/free', 'gratis, otomatis memilih model yang bisa membaca gambar'),
+    ModelOpt('google/gemini-3.6-flash', 'berbayar, kualitas tinggi'),
+  ]),
+  ProviderInfo('groq', 'Groq', 'https://api.groq.com/openai/v1', 'qwen/qwen3.8-27b',
+      'console.groq.com/keys', [
+    ModelOpt('qwen/qwen3.8-27b', 'model gambar Groq saat ini, maksimal 3 gambar per file'),
+  ]),
   ProviderInfo('mistral', 'Mistral', 'https://api.mistral.ai/v1', 'mistral-small-latest',
-      'console.mistral.ai/api-keys'),
+      'console.mistral.ai/api-keys', [
+    ModelOpt('mistral-small-latest', 'cepat dan hemat'),
+    ModelOpt('mistral-medium-latest', 'lebih akurat'),
+    ModelOpt('mistral-large-latest', 'paling akurat'),
+  ]),
   ProviderInfo('custom', 'Kustom (gaya OpenAI)', '', '',
-      'isi alamat API dan nama model sendiri (mis. Together, NVIDIA NIM)'),
+      'isi alamat API dan nama model sendiri (mis. Together, NVIDIA NIM)', []),
 ];
 
 ProviderInfo providerOf(String id) =>
@@ -56,6 +92,20 @@ class Settings {
   String inputDir = '';
   String outputDir = '';
 
+  /// Daftar model hasil "Perbarui daftar model" (kosong = pakai daftar bawaan).
+  final Map<String, List<ModelOpt>> live = {};
+
+  List<ModelOpt> modelsFor(String p) {
+    final l = live[p];
+    return (l != null && l.isNotEmpty) ? l : providerOf(p).models;
+  }
+
+  Future<void> saveModels(String p, List<ModelOpt> list) async {
+    live[p] = list;
+    final sp = await SharedPreferences.getInstance();
+    await sp.setStringList('models_$p', [for (final m in list) '${m.id}\t${m.note}']);
+  }
+
   List<String> get keyList => keys
       .split(RegExp(r'[\s,;]+'))
       .map((e) => e.trim())
@@ -73,6 +123,14 @@ class Settings {
         legacyModel ??
         providerOf(provider).defaultModel;
     customBase = sp.getString('customBase') ?? customBase;
+    final saved = sp.getStringList('models_$provider');
+    if (saved != null && saved.isNotEmpty) {
+      live[provider] = [for (final e in saved) _optFromString(e)];
+    }
+    // model tersimpan yang sudah tidak ada di daftar diganti ke bawaan
+    if (provider != 'custom' && !modelsFor(provider).any((m) => m.id == model)) {
+      model = providerOf(provider).defaultModel;
+    }
   }
 
   Future<void> load() async {
@@ -851,6 +909,146 @@ Future<JpegMeta> readMp4Metadata(String path) async {
   return r;
 }
 
+/// Mengambil daftar model yang bisa membaca gambar langsung dari penyedia.
+Future<List<ModelOpt>> fetchModels(String provider, String key) async {
+  Future<dynamic> getJson(String url, {Map<String, String>? headers}) async {
+    final res = await http
+        .get(Uri.parse(url), headers: headers)
+        .timeout(const Duration(seconds: 30));
+    if (res.statusCode != 200) {
+      var msg = res.body.length > 120 ? res.body.substring(0, 120) : res.body;
+      try {
+        final j = jsonDecode(utf8.decode(res.bodyBytes));
+        final e = j['error'];
+        if (e is Map && e['message'] != null) {
+          msg = e['message'].toString();
+        } else if (e is String) {
+          msg = e;
+        }
+      } catch (_) {}
+      throw Exception('HTTP ${res.statusCode}: $msg');
+    }
+    return jsonDecode(utf8.decode(res.bodyBytes));
+  }
+
+  final out = <ModelOpt>[];
+  switch (provider) {
+    case 'gemini':
+      {
+        final bad = RegExp(
+          r'(embedding|tts|image|live|audio|robotics|computer|research|omni|native|-pro)',
+          caseSensitive: false,
+        );
+        final names = <String>{};
+        var token = '';
+        for (var page = 0; page < 5; page++) {
+          final url = 'https://generativelanguage.googleapis.com/v1beta/models?pageSize=200'
+              '${token.isEmpty ? "" : "&pageToken=$token"}';
+          final j = await getJson(url, headers: {'x-goog-api-key': key});
+          for (final m in (j['models'] as List? ?? const [])) {
+            final name = (m['name'] ?? '').toString().replaceFirst('models/', '');
+            final methods = (m['supportedGenerationMethods'] as List?) ?? const [];
+            if (!methods.contains('generateContent')) continue;
+            if (!name.startsWith('gemini-') || !name.contains('flash')) continue;
+            if (name.startsWith('gemini-1') || name.startsWith('gemini-2')) continue;
+            if (bad.hasMatch(name)) continue;
+            names.add(name);
+          }
+          token = (j['nextPageToken'] ?? '').toString();
+          if (token.isEmpty) break;
+        }
+        final list = names.toList()..sort((a, b) => b.compareTo(a));
+        for (final n in list) {
+          out.add(ModelOpt(n, n.contains('lite') ? 'hemat, cocok untuk batch besar' : ''));
+        }
+        break;
+      }
+    case 'openrouter':
+      {
+        final j = await getJson('https://openrouter.ai/api/v1/models');
+        bool zero(dynamic v) => double.tryParse((v ?? '').toString()) == 0;
+        final rows = <Map<String, dynamic>>[];
+        for (final m in (j['data'] as List? ?? const [])) {
+          if (m is! Map) continue;
+          final arch = m['architecture'];
+          final ins = arch is Map ? (arch['input_modalities'] as List? ?? const []) : const [];
+          final outs = arch is Map ? (arch['output_modalities'] as List? ?? const []) : const [];
+          if (!ins.contains('image') || !outs.contains('text')) continue;
+          final id = (m['id'] ?? '').toString();
+          if (id.isEmpty || id == 'openrouter/free') continue;
+          final pr = m['pricing'];
+          final free = id.endsWith(':free') ||
+              (pr is Map && zero(pr['prompt']) && zero(pr['completion']));
+          if (!free) continue;
+          rows.add({
+            'id': id,
+            'name': (m['name'] ?? '').toString(),
+            'created': m['created'] is num ? (m['created'] as num).toInt() : 0,
+          });
+        }
+        rows.sort((a, b) => (b['created'] as int).compareTo(a['created'] as int));
+        out.add(const ModelOpt(
+          'openrouter/free',
+          'gratis, otomatis memilih model yang bisa membaca gambar',
+        ));
+        for (final r in rows.take(40)) {
+          out.add(ModelOpt(r['id'] as String, r['name'] as String));
+        }
+        break;
+      }
+    case 'groq':
+      {
+        final j = await getJson(
+          'https://api.groq.com/openai/v1/models',
+          headers: {'Authorization': 'Bearer $key'},
+        );
+        final vis = RegExp(r'(qwen/qwen3\.\d|vision|-vl|llama-4|maverick|scout)',
+            caseSensitive: false);
+        final bad = RegExp(r'(guard|whisper|orpheus|tts|safeguard)', caseSensitive: false);
+        final ids = <String>{};
+        for (final m in (j['data'] as List? ?? const [])) {
+          if (m is! Map || m['active'] == false) continue;
+          final id = (m['id'] ?? '').toString();
+          if (id.isEmpty || bad.hasMatch(id) || !vis.hasMatch(id)) continue;
+          ids.add(id);
+        }
+        for (final id in ids) {
+          out.add(ModelOpt(id, 'terdeteksi otomatis'));
+        }
+        break;
+      }
+    case 'mistral':
+      {
+        final j = await getJson(
+          'https://api.mistral.ai/v1/models',
+          headers: {'Authorization': 'Bearer $key'},
+        );
+        final seen = <String>{};
+        for (final m in (j['data'] as List? ?? const [])) {
+          if (m is! Map) continue;
+          final cap = m['capabilities'];
+          if (cap is! Map || cap['vision'] != true || cap['completion_chat'] == false) continue;
+          final id = (m['id'] ?? '').toString();
+          if (id.isEmpty || id.toLowerCase().contains('ocr')) continue;
+          String? latest;
+          final al = m['aliases'];
+          if (al is List) {
+            for (final a in al) {
+              if (a.toString().endsWith('-latest')) {
+                latest = a.toString();
+                break;
+              }
+            }
+          }
+          final pick = latest ?? id;
+          if (seen.add(pick)) out.add(ModelOpt(pick));
+        }
+        break;
+      }
+  }
+  return out;
+}
+
 class Processor {
   /// [files] diisi bila pengguna memilih file tertentu. Kalau null, semua file
   /// di folder input diproses.
@@ -1233,7 +1431,10 @@ Rules:
   }
 
   Meta _parse(String text) {
-    final t = text.trim();
+    var t = text.replaceAll(RegExp(r'<think>.*?</think>', dotAll: true, caseSensitive: false), '');
+    final endThink = t.toLowerCase().lastIndexOf('</think>');
+    if (endThink >= 0) t = t.substring(endThink + 8);
+    t = t.trim();
     final a = t.indexOf('{');
     final b = t.lastIndexOf('}');
     if (a < 0 || b <= a) throw Exception('Balasan AI bukan JSON');
