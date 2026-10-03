@@ -327,6 +327,20 @@ class JpegMeta {
   List<String> iptcKeywords = [];
   String? xmpTitle;
   List<String> xmpKeywords = [];
+  String? itunesTitle;
+  List<String> itunesKeywords = [];
+}
+
+void _parseXmp(String xml, JpegMeta r) {
+  final t = RegExp(r'<dc:title>.*?<rdf:li[^>]*>(.*?)</rdf:li>', dotAll: true).firstMatch(xml);
+  if (t != null) r.xmpTitle = _xmlUnesc(t.group(1)!);
+  final sb = RegExp(r'<dc:subject>(.*?)</dc:subject>', dotAll: true).firstMatch(xml);
+  if (sb != null) {
+    r.xmpKeywords = RegExp(r'<rdf:li[^>]*>(.*?)</rdf:li>', dotAll: true)
+        .allMatches(sb.group(1)!)
+        .map((e) => _xmlUnesc(e.group(1)!))
+        .toList();
+  }
 }
 
 void _readIptc(Uint8List d, int start, int end, JpegMeta r) {
@@ -391,20 +405,448 @@ JpegMeta readJpegMetadata(Uint8List data) {
         data.sublist(pos + 4 + xmpHead.length, end),
         allowMalformed: true,
       );
-      final t = RegExp(r'<dc:title>.*?<rdf:li[^>]*>(.*?)</rdf:li>', dotAll: true)
-          .firstMatch(xml);
-      if (t != null) r.xmpTitle = _xmlUnesc(t.group(1)!);
-      final sb = RegExp(r'<dc:subject>(.*?)</dc:subject>', dotAll: true).firstMatch(xml);
-      if (sb != null) {
-        r.xmpKeywords = RegExp(r'<rdf:li[^>]*>(.*?)</rdf:li>', dotAll: true)
-            .allMatches(sb.group(1)!)
-            .map((e) => _xmlUnesc(e.group(1)!))
-            .toList();
-      }
+      _parseXmp(xml, r);
     } else if (m == 0xed && _hasPrefix(data, pos + 4, psHead)) {
       _readIrb(data, pos + 4 + psHead.length, end, r);
     }
     pos = end;
+  }
+  return r;
+}
+
+// ------------------------------------------------------------------
+// Tanam metadata ke MP4 (tag iTunes + XMP) tanpa FFmpeg dan tanpa encode ulang.
+// File ditulis ke berkas sementara, diverifikasi, baru menggantikan file asli.
+// ------------------------------------------------------------------
+
+const _xmpUuid = <int>[
+  0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, //
+  0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF, 0xAC,
+];
+
+const _oursTags = {'\u00A9nam', 'desc', '\u00A9cmt', 'keyw'};
+
+int _u32(Uint8List d, int o) =>
+    (d[o] << 24) | (d[o + 1] << 16) | (d[o + 2] << 8) | d[o + 3];
+
+List<int> _u32b(int v) =>
+    [(v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
+
+int _rd(Uint8List m, int p, int w) =>
+    w == 4 ? _u32(m, p) : (_u32(m, p) << 32) | _u32(m, p + 4);
+
+void _wr(Uint8List m, int p, int w, int v) {
+  if (w == 8) {
+    m.setRange(p, p + 4, _u32b(v >> 32));
+    m.setRange(p + 4, p + 8, _u32b(v & 0xffffffff));
+  } else {
+    m.setRange(p, p + 4, _u32b(v));
+  }
+}
+
+Uint8List _cat(List<List<int>> parts) {
+  final b = BytesBuilder(copy: false);
+  for (final x in parts) {
+    b.add(x);
+  }
+  return b.takeBytes();
+}
+
+Uint8List _box(String type, List<int> payload) {
+  final b = BytesBuilder(copy: false);
+  b.add(_u32b(8 + payload.length));
+  b.add(latin1.encode(type));
+  b.add(payload);
+  return b.takeBytes();
+}
+
+class _B {
+  _B(this.type, this.off, this.size, this.hl, this.xmp);
+  final String type;
+  final int off;
+  final int size;
+  final int hl;
+  final bool xmp;
+}
+
+class _Ch {
+  _Ch(this.type, this.off, this.size);
+  final String type;
+  final int off;
+  final int size;
+}
+
+class _Lay {
+  _Lay(this.box, this.noff);
+  final _B box;
+  final int noff;
+}
+
+class _MoovResult {
+  _MoovResult(this.bytes, this.itunes);
+  final Uint8List bytes;
+  final bool itunes;
+}
+
+Future<List<_B>> _scanTop(RandomAccessFile f, int flen) async {
+  final boxes = <_B>[];
+  var o = 0;
+  while (o < flen) {
+    await f.setPosition(o);
+    final h = await f.read(32);
+    if (h.length < 8) throw Exception('Struktur MP4 rusak');
+    var size = _u32(h, 0);
+    final typ = String.fromCharCodes(h, 4, 8);
+    var hl = 8;
+    if (size == 1) {
+      if (h.length < 16) throw Exception('Struktur MP4 rusak');
+      size = (_u32(h, 8) << 32) | _u32(h, 12);
+      hl = 16;
+    } else if (size == 0) {
+      throw Exception('Box berukuran 0 belum didukung');
+    }
+    if (size < hl || o + size > flen) throw Exception('Struktur MP4 rusak');
+    var isXmp = false;
+    if (typ == 'uuid' && h.length >= hl + 16) {
+      isXmp = true;
+      for (var i = 0; i < 16; i++) {
+        if (h[hl + i] != _xmpUuid[i]) {
+          isXmp = false;
+          break;
+        }
+      }
+    }
+    boxes.add(_B(typ, o, size, hl, isXmp));
+    o += size;
+  }
+  return boxes;
+}
+
+List<_Ch> _children(Uint8List d, int start, int end) {
+  final out = <_Ch>[];
+  var o = start;
+  while (o + 8 <= end) {
+    final size = _u32(d, o);
+    if (size < 8 || o + size > end) {
+      throw Exception('Box di dalam moov tidak didukung');
+    }
+    out.add(_Ch(String.fromCharCodes(d, o + 4, o + 8), o, size));
+    o += size;
+  }
+  if (o != end) throw Exception('Box di dalam moov tidak rapi');
+  return out;
+}
+
+Uint8List _dataAtom(String text) =>
+    _box('data', _cat([const [0, 0, 0, 1, 0, 0, 0, 0], utf8.encode(text)]));
+
+Uint8List _item(String t, String text) => _box(t, _dataAtom(text));
+
+Uint8List _hdlrBox() => _box(
+      'hdlr',
+      _cat([
+        const [0, 0, 0, 0, 0, 0, 0, 0],
+        latin1.encode('mdirappl'),
+        const [0, 0, 0, 0, 0, 0, 0, 0, 0],
+      ]),
+    );
+
+Uint8List _ourItems(String title, List<String> kws) {
+  final k = kws.join(', ');
+  return _cat([
+    _item('\u00A9nam', title),
+    _item('desc', title),
+    _item('\u00A9cmt', k),
+    _item('keyw', k),
+  ]);
+}
+
+Uint8List _keptItems(Uint8List ilst) {
+  final b = BytesBuilder(copy: false);
+  for (final c in _children(ilst, 0, ilst.length)) {
+    if (!_oursTags.contains(c.type)) b.add(ilst.sublist(c.off, c.off + c.size));
+  }
+  return b.takeBytes();
+}
+
+Uint8List _newMeta(String title, List<String> kws) => _box(
+      'meta',
+      _cat([
+        const [0, 0, 0, 0],
+        _hdlrBox(),
+        _box('ilst', _ourItems(title, kws)),
+      ]),
+    );
+
+/// Mengembalikan box meta baru, atau null bila gaya meta-nya tidak didukung.
+Uint8List? _rebuildMeta(Uint8List moov, int off, int size, String title, List<String> kws) {
+  final pl = moov.sublist(off + 8, off + size);
+  if (pl.length < 12 || String.fromCharCodes(pl, 8, 12) != 'hdlr') return null;
+  final kids = _children(pl, 4, pl.length);
+  _Ch? hd;
+  for (final c in kids) {
+    if (c.type == 'hdlr') {
+      hd = c;
+      break;
+    }
+  }
+  if (hd == null ||
+      hd.off + 20 > pl.length ||
+      String.fromCharCodes(pl, hd.off + 16, hd.off + 20) != 'mdir') {
+    return null;
+  }
+  final b = BytesBuilder(copy: false);
+  b.add(pl.sublist(0, 4));
+  var had = false;
+  for (final c in kids) {
+    if (c.type == 'ilst' && !had) {
+      had = true;
+      final inner = pl.sublist(c.off + 8, c.off + c.size);
+      b.add(_box('ilst', _cat([_keptItems(inner), _ourItems(title, kws)])));
+    } else {
+      b.add(pl.sublist(c.off, c.off + c.size));
+    }
+  }
+  if (!had) b.add(_box('ilst', _ourItems(title, kws)));
+  return _box('meta', b.takeBytes());
+}
+
+_MoovResult _buildMoov(Uint8List moov, String title, List<String> kws) {
+  if (_u32(moov, 0) != moov.length) {
+    throw Exception('moov berukuran 64-bit belum didukung');
+  }
+  final kids = _children(moov, 8, moov.length);
+  final payload = BytesBuilder(copy: false);
+  var done = false;
+  var itunes = true;
+  for (final k in kids) {
+    if (k.type == 'udta' && !done) {
+      done = true;
+      try {
+        final up = BytesBuilder(copy: false);
+        var mdone = false;
+        for (final u in _children(moov, k.off + 8, k.off + k.size)) {
+          if (u.type == 'meta' && !mdone) {
+            mdone = true;
+            final m = _rebuildMeta(moov, u.off, u.size, title, kws);
+            if (m == null) {
+              itunes = false;
+              up.add(moov.sublist(u.off, u.off + u.size));
+            } else {
+              up.add(m);
+            }
+          } else {
+            up.add(moov.sublist(u.off, u.off + u.size));
+          }
+        }
+        if (!mdone) up.add(_newMeta(title, kws));
+        payload.add(_box('udta', up.takeBytes()));
+      } catch (_) {
+        itunes = false;
+        payload.add(moov.sublist(k.off, k.off + k.size));
+      }
+    } else {
+      payload.add(moov.sublist(k.off, k.off + k.size));
+    }
+  }
+  if (!done) payload.add(_box('udta', _newMeta(title, kws)));
+  return _MoovResult(_box('moov', payload.takeBytes()), itunes);
+}
+
+void _stcoWalk(Uint8List moov, void Function(int off, int width) fn) {
+  void walk(int start, int end) {
+    for (final c in _children(moov, start, end)) {
+      if (c.type == 'trak' || c.type == 'mdia' || c.type == 'minf' || c.type == 'stbl') {
+        walk(c.off + 8, c.off + c.size);
+      } else if (c.type == 'stco') {
+        fn(c.off, 4);
+      } else if (c.type == 'co64') {
+        fn(c.off, 8);
+      }
+    }
+  }
+
+  walk(8, moov.length);
+}
+
+List<int> _firstEntries(Uint8List moov) {
+  final res = <int>[];
+  _stcoWalk(moov, (o, w) {
+    if (_u32(moov, o + 12) > 0) res.add(_rd(moov, o + 16, w));
+  });
+  return res;
+}
+
+Future<bool> _mp4WriteTemp(String path, String tmpPath, String title, List<String> kws) async {
+  final src = await File(path).open();
+  try {
+    final flen = await src.length();
+    final boxes = await _scanTop(src, flen);
+    if (boxes.any((b) => b.type == 'moof' || b.type == 'mfra')) {
+      throw Exception('MP4 jenis fragmen belum didukung');
+    }
+    final moovs = boxes.where((b) => b.type == 'moov').toList();
+    if (moovs.length != 1) throw Exception('Atom moov tidak ditemukan');
+    final mv = moovs.first;
+    if (mv.hl != 8 || mv.size > 64 * 1024 * 1024) {
+      throw Exception('Atom moov tidak didukung');
+    }
+    await src.setPosition(mv.off);
+    final oldMoov = await src.read(mv.size);
+    final built = _buildMoov(oldMoov, title, kws);
+    final nm = built.bytes;
+    final xmpBox = _box('uuid', _cat([_xmpUuid, _buildXmp(title, kws)]));
+
+    // tata letak baru: moov diganti, XMP lama dibuang, XMP baru ditaruh di akhir
+    var cur = 0;
+    final layout = <_Lay>[];
+    for (final b in boxes) {
+      if (b.xmp) continue;
+      layout.add(_Lay(b, cur));
+      cur += identical(b, mv) ? nm.length : b.size;
+    }
+    final expected = cur + xmpBox.length;
+    final mdats = [
+      for (final e in layout)
+        if (e.box.type == 'mdat') e,
+    ];
+    int mapOff(int old) {
+      for (final e in mdats) {
+        if (old >= e.box.off && old < e.box.off + e.box.size) {
+          return old + (e.noff - e.box.off);
+        }
+      }
+      throw Exception('Offset chunk di luar mdat');
+    }
+
+    _stcoWalk(nm, (o, w) {
+      final cnt = _u32(nm, o + 12);
+      for (var i = 0; i < cnt; i++) {
+        final pos = o + 16 + i * w;
+        final v = mapOff(_rd(nm, pos, w));
+        if (w == 4 && v > 0xFFFFFFFF) throw Exception('Offset melebihi 4 GB');
+        _wr(nm, pos, w, v);
+      }
+    });
+
+    final out = await File(tmpPath).open(mode: FileMode.write);
+    try {
+      for (final e in layout) {
+        if (identical(e.box, mv)) {
+          await out.writeFrom(nm);
+        } else {
+          await src.setPosition(e.box.off);
+          var left = e.box.size;
+          while (left > 0) {
+            final chunk = await src.read(left < 4194304 ? left : 4194304);
+            if (chunk.isEmpty) throw Exception('Pembacaan file terputus');
+            await out.writeFrom(chunk);
+            left -= chunk.length;
+          }
+        }
+      }
+      await out.writeFrom(xmpBox);
+      await out.flush();
+    } finally {
+      await out.close();
+    }
+
+    // verifikasi: ukuran, struktur, dan isi chunk pertama tiap track
+    final olds = _firstEntries(oldMoov);
+    final news = _firstEntries(nm);
+    if (olds.length != news.length) throw Exception('Verifikasi gagal (jumlah track)');
+    final chk = await File(tmpPath).open();
+    try {
+      final tl = await chk.length();
+      if (tl != expected) throw Exception('Verifikasi gagal (ukuran file)');
+      await _scanTop(chk, tl);
+      for (var i = 0; i < olds.length; i++) {
+        await src.setPosition(olds[i]);
+        final a = await src.read(64);
+        await chk.setPosition(news[i]);
+        final c = await chk.read(64);
+        var same = a.length == c.length;
+        for (var j = 0; same && j < a.length; j++) {
+          if (a[j] != c[j]) same = false;
+        }
+        if (!same) throw Exception('Verifikasi gagal (isi video berbeda)');
+      }
+    } finally {
+      await chk.close();
+    }
+    return built.itunes;
+  } finally {
+    await src.close();
+  }
+}
+
+/// Tanam metadata ke MP4. Mengembalikan true bila tag iTunes ikut ditanam.
+Future<bool> embedMp4Metadata(String path, String title, List<String> kws) async {
+  final tmp = '$path.tmp';
+  try {
+    final itunes = await _mp4WriteTemp(path, tmp, title, kws);
+    await File(tmp).rename(path);
+    return itunes;
+  } catch (_) {
+    try {
+      final t = File(tmp);
+      if (t.existsSync()) t.deleteSync();
+    } catch (_) {}
+    rethrow;
+  }
+}
+
+void _readItunes(Uint8List moov, JpegMeta r) {
+  try {
+    for (final k in _children(moov, 8, moov.length)) {
+      if (k.type != 'udta') continue;
+      for (final u in _children(moov, k.off + 8, k.off + k.size)) {
+        if (u.type != 'meta') continue;
+        final pl = moov.sublist(u.off + 8, u.off + u.size);
+        if (pl.length < 12 || String.fromCharCodes(pl, 8, 12) != 'hdlr') continue;
+        for (final m in _children(pl, 4, pl.length)) {
+          if (m.type != 'ilst') continue;
+          final ilst = pl.sublist(m.off + 8, m.off + m.size);
+          for (final it in _children(ilst, 0, ilst.length)) {
+            if (it.size < 24) continue;
+            final text = utf8.decode(ilst.sublist(it.off + 24, it.off + it.size),
+                allowMalformed: true);
+            if (it.type == '\u00A9nam') r.itunesTitle = text;
+            if (it.type == 'keyw') {
+              r.itunesKeywords = text
+                  .split(',')
+                  .map((e) => e.trim())
+                  .where((e) => e.isNotEmpty)
+                  .toList();
+            }
+          }
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+Future<JpegMeta> readMp4Metadata(String path) async {
+  final r = JpegMeta();
+  final f = await File(path).open();
+  try {
+    final flen = await f.length();
+    final boxes = await _scanTop(f, flen);
+    for (final b in boxes) {
+      if (b.xmp) {
+        final start = b.off + b.hl + 16;
+        final len = b.off + b.size - start;
+        if (len > 0 && len < 4 * 1024 * 1024) {
+          await f.setPosition(start);
+          _parseXmp(utf8.decode(await f.read(len), allowMalformed: true), r);
+        }
+      } else if (b.type == 'moov' && b.hl == 8 && b.size <= 64 * 1024 * 1024) {
+        await f.setPosition(b.off);
+        _readItunes(await f.read(b.size), r);
+      }
+    }
+  } finally {
+    await f.close();
   }
   return r;
 }
@@ -879,12 +1321,36 @@ Rules:
 
   bool _warnedNoEmbed = false;
 
+  Future<void> _embedVideo(String path, Meta m) async {
+    try {
+      final size = await File(path).length();
+      if (size > 100 * 1024 * 1024) {
+        log('  … menulis ulang file video (${(size / (1024 * 1024)).toStringAsFixed(0)} MB), mohon tunggu');
+      }
+      final itunes = await embedMp4Metadata(path, m.title, m.keywords);
+      final chk = await readMp4Metadata(path);
+      final ok = chk.xmpTitle == m.title && chk.xmpKeywords.isNotEmpty;
+      final tail = itunes
+          ? 'tag iTunes ${chk.itunesKeywords.length} keyword'
+          : 'tag iTunes dilewati';
+      log(ok
+          ? '  ✔ Metadata video tertanam dan terbaca ulang: XMP ${chk.xmpKeywords.length} keyword, $tail'
+          : '  ⚠ Metadata video ditulis tapi gagal dibaca ulang');
+    } catch (e) {
+      log('  ⚠ Metadata video tidak ditanam: $e (data tetap ada di CSV)');
+    }
+  }
+
   Future<void> _embed(String path, Meta m) async {
     final ext = p.extension(path).toLowerCase();
+    if (ext == '.mp4' || ext == '.m4v') {
+      await _embedVideo(path, m);
+      return;
+    }
     if (ext != '.jpg' && ext != '.jpeg') {
       if (!_warnedNoEmbed) {
         _warnedNoEmbed = true;
-        log('  ℹ Metadata hanya ditanam ke JPG. Video/PNG/WebP memakai CSV.');
+        log('  ℹ Metadata hanya ditanam ke JPG dan MP4. File lain memakai CSV.');
       }
       return;
     }
