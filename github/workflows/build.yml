@@ -3,6 +3,8 @@ name: Build APK
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'README.md'
   workflow_dispatch:
 
 permissions:
@@ -22,6 +24,7 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: '3.35.x'
           cache: true
 
       - name: Siapkan proyek Android
@@ -51,15 +54,52 @@ jobs:
 
       - run: flutter pub get
 
-      - run: flutter build apk --release
+      - name: Tambal plugin video_thumbnail
+        run: |
+          python3 - <<'PY'
+          import glob, os, re
+          for d in glob.glob(os.path.expanduser('~/.pub-cache/hosted/pub.dev/video_thumbnail-*/android')):
+              g = os.path.join(d, 'build.gradle')
+              s = open(g, encoding='utf-8').read()
+              s = s.replace('jcenter()', 'mavenCentral()')
+              if 'namespace' not in s:
+                  m = open(os.path.join(d, 'src/main/AndroidManifest.xml'), encoding='utf-8').read()
+                  pkg = re.search(r'package="([^"]+)"', m).group(1)
+                  s = re.sub(r'android\s*\{', "android {\n    namespace '" + pkg + "'", s, count=1)
+              open(g, 'w', encoding='utf-8').write(s)
+              print('Ditambal:', g)
+          PY
+
+      - run: flutter build apk --release --build-number=${{ github.run_number }}
+
+      - name: Tanda tangan APK dengan kunci tetap
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          OUT=build/app/outputs/flutter-apk/stok-meta.apk
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ]; then
+            echo "Kunci tetap belum diatur. Memakai tanda tangan sementara."
+            cp "$APK" "$OUT"
+            exit 0
+          fi
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/ks.jks"
+          "$BT/zipalign" -p -f 4 "$APK" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/ks.jks" --ks-key-alias stokmeta \
+            --ks-pass env:KS_PASS --key-pass env:KS_PASS \
+            --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs "$OUT" | head -3
+          rm -f "$RUNNER_TEMP/ks.jks"
 
       - uses: actions/upload-artifact@v4
         with:
           name: stok-meta-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: build/app/outputs/flutter-apk/stok-meta.apk
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: Stok Meta build ${{ github.run_number }}
-          files: build/app/outputs/flutter-apk/app-release.apk
+          files: build/app/outputs/flutter-apk/stok-meta.apk
