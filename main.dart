@@ -194,11 +194,18 @@ class _HomePageState extends State<HomePage> {
     final f = File(r.files.first.path!);
     _log('── Periksa metadata: ${p.basename(f.path)}');
     try {
-      final m = readJpegMetadata(await f.readAsBytes());
+      final ext = p.extension(f.path).toLowerCase();
+      final isVideo = ext == '.mp4' || ext == '.m4v';
+      final m = isVideo ? await readMp4Metadata(f.path) : readJpegMetadata(await f.readAsBytes());
       _log('  XMP  judul   : ${m.xmpTitle ?? "(kosong)"}');
       _log('  XMP  keyword : ${m.xmpKeywords.length}');
-      _log('  IPTC judul   : ${m.iptcTitle ?? "(kosong)"}');
-      _log('  IPTC keyword : ${m.iptcKeywords.length}');
+      if (isVideo) {
+        _log('  iTunes judul   : ${m.itunesTitle ?? "(kosong)"}');
+        _log('  iTunes keyword : ${m.itunesKeywords.length}');
+      } else {
+        _log('  IPTC judul   : ${m.iptcTitle ?? "(kosong)"}');
+        _log('  IPTC keyword : ${m.iptcKeywords.length}');
+      }
       if (m.xmpKeywords.isNotEmpty) {
         _log('  Contoh: ${m.xmpKeywords.take(8).join(", ")}');
       }
@@ -498,14 +505,14 @@ class _HomePageState extends State<HomePage> {
               ]),
               _switch('Rename file sesuai judul', s.rename, (v) => s.rename = v),
               _switch('Pindah ke output (mati = salin)', s.move, (v) => s.move = v),
-              _switch('Tanam metadata ke foto JPG', s.embed, (v) => s.embed = v),
+              _switch('Tanam metadata ke file (JPG dan MP4)', s.embed, (v) => s.embed = v),
               _switch('Export CSV Adobe Stock', s.csv, (v) => s.csv = v),
               _switch('Auto retry', s.retry, (v) => s.retry = v),
             ]),
             OutlinedButton.icon(
               onPressed: running ? null : _checkFile,
               icon: const Icon(Icons.fact_check_outlined),
-              label: const Text('Periksa metadata file JPG'),
+              label: const Text('Periksa metadata file (JPG atau MP4)'),
             ),
             const SizedBox(height: 12),
             Row(children: [
